@@ -27,7 +27,7 @@ Before you begin, ensure you have met the following requirements:
 - Docker and Docker Compose installed on your system
 - A Telegram bot token (you can get one from [@BotFather](https://t.me/BotFather) on Telegram)
 - API ID and Hash: You can get these by creating an application on [my.telegram.org](https://my.telegram.org)
-- To Get `SESSION_STRING` Open [@SmartUtilBot](https://t.me/SmartUtilBot). Bot and use /pyro command and then follow all instructions
+- To Get `SESSION_STRING` Open [@@TgDevToolBot](https://t.me/TgDevToolBot). Bot and use 🔐 Pyrogram Session button and then follow all instructions
 
 > **Note**: All dependencies including Python, `kurigram`, `pyleaves`, `tgcrypto`, and `ffmpeg` are automatically installed when you deploy with Docker Compose.
 
