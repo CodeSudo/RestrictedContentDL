@@ -11,58 +11,41 @@ from pyleaves import Leaves
 from pyrogram.enums import ParseMode
 from pyrogram import Client, filters
 from pyrogram.errors import PeerIdInvalid, BadRequest, FloodWait
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
-from helpers.utils import (
-    processMediaGroup,
-    progressArgs,
-    send_media
-)
-
+from helpers.utils import processMediaGroup, progressArgs, send_media
 from helpers.forward import check_forward_permission, resolve_forward_chat_id
-
 from helpers.files import (
-    get_download_path,
-    fileSizeLimit,
-    get_readable_file_size,
-    get_readable_time,
-    cleanup_download,
-    cleanup_downloads_root
+    get_download_path, fileSizeLimit, get_readable_file_size,
+    get_readable_time, cleanup_download, cleanup_downloads_root
 )
-
-from helpers.msg import (
-    getChatMsgID,
-    get_file_name,
-    get_raw_text
-)
-
+from helpers.msg import getChatMsgID, get_file_name, get_raw_text
 from config import PyroConf
 from logger import LOGGER
 
+# ✅ Import our new per-user GDrive logic
+from gdrive_helper import upload_to_drive_user, get_user_credentials, generate_auth_url, authorize_user
+
 # Initialize the bot client
 bot = Client(
-    "media_bot",
-    api_id=PyroConf.API_ID,
-    api_hash=PyroConf.API_HASH,
-    bot_token=PyroConf.BOT_TOKEN,
-    workers=100,
-    parse_mode=ParseMode.MARKDOWN,
-    max_concurrent_transmissions=1, # ✅ SAFE DEFAULT
-    sleep_threshold=30,
+    "media_bot", api_id=PyroConf.API_ID, api_hash=PyroConf.API_HASH,
+    bot_token=PyroConf.BOT_TOKEN, workers=100, parse_mode=ParseMode.MARKDOWN,
+    max_concurrent_transmissions=1, sleep_threshold=30,
 )
 
 # Client for user session
 user = Client(
-    "user_session",
-    workers=100,
-    session_string=PyroConf.SESSION_STRING,
-    max_concurrent_transmissions=1, # ✅ SAFE DEFAULT
-    sleep_threshold=30,
+    "user_session", workers=100, session_string=PyroConf.SESSION_STRING,
+    max_concurrent_transmissions=1, sleep_threshold=30,
 )
 
 RUNNING_TASKS = set()
 download_semaphore = None
 forward_chat_id = None
+
+# State tracking dictionaries
+PENDING_DOWNLOADS = {}
+AWAITING_AUTH = {}
 
 def track_task(coro):
     task = asyncio.create_task(coro)
@@ -72,7 +55,6 @@ def track_task(coro):
     task.add_done_callback(_remove)
     return task
 
-
 @bot.on_message(filters.command("start") & filters.private)
 async def start(_, message: Message):
     welcome_text = (
@@ -80,47 +62,10 @@ async def start(_, message: Message):
         "I can grab photos, videos, audio, and documents from any Telegram post.\n"
         "Just send me a link (paste it directly or use `/dl <link>`),\n"
         "or reply to a message with `/dl`.\n\n"
-        "ℹ️ Use `/help` to view all commands and examples.\n"
-        "🔒 Make sure the user client is part of the chat.\n\n"
         "Ready? Send me a Telegram post link!"
     )
-
-    markup = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Update Channel", url="https://t.me/itsSmartDev")]]
-    )
+    markup = InlineKeyboardMarkup([[InlineKeyboardButton("Update Channel", url="https://t.me/itsSmartDev")]])
     await message.reply(welcome_text, reply_markup=markup, disable_web_page_preview=True)
-
-
-@bot.on_message(filters.command("help") & filters.private)
-async def help_command(_, message: Message):
-    help_text = (
-        "💡 **Media Downloader Bot Help**\n\n"
-        "➤ **Download Media**\n"
-        "   – Send `/dl <post_URL>` **or** just paste a Telegram post link to fetch photos, videos, audio, or documents.\n\n"
-        "➤ **Batch Download**\n"
-        "   – Send `/bdl start_link end_link` to grab a series of posts in one go.\n"
-        "     💡 Example: `/bdl https://t.me/mychannel/100 https://t.me/mychannel/120`\n"
-        "**It will download all posts from ID 100 to 120.**\n\n"
-        "➤ **Requirements**\n"
-        "   – Make sure the user client is part of the chat.\n\n"
-        "➤ **If the bot hangs**\n"
-        "   – Send `/killall` to cancel any pending downloads.\n\n"
-        "➤ **Logs**\n"
-        "   – Send `/logs` to download the bot’s logs file.\n\n"
-        "➤ **Cleanup**\n"
-        "   – Send `/cleanup` to remove temporary downloaded files from disk.\n\n"
-        "➤ **Stats**\n"
-        "   – Send `/stats` to view current status:\n\n"
-        "**Example**:\n"
-        "  • `/dl https://t.me/itsSmartDev/547`\n"
-        "  • `https://t.me/itsSmartDev/547`"
-    )
-    
-    markup = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Update Channel", url="https://t.me/itsSmartDev")]]
-    )
-    await message.reply(help_text, reply_markup=markup, disable_web_page_preview=True)
-
 
 @bot.on_message(filters.command("cleanup") & filters.private)
 async def cleanup_storage(_, message: Message):
@@ -128,16 +73,12 @@ async def cleanup_storage(_, message: Message):
         files_removed, bytes_freed = cleanup_downloads_root()
         if files_removed == 0:
             return await message.reply("🧹 **Cleanup complete:** no local downloads found.")
-        return await message.reply(
-            f"🧹 **Cleanup complete:** removed `{files_removed}` file(s), "
-            f"freed `{get_readable_file_size(bytes_freed)}`."
-        )
+        return await message.reply(f"🧹 **Cleanup complete:** removed `{files_removed}` file(s), freed `{get_readable_file_size(bytes_freed)}`.")
     except Exception as e:
         LOGGER(__name__).error(f"Cleanup failed: {e}")
         return await message.reply("❌ **Cleanup failed.** Check logs for details.")
 
-
-async def handle_download(bot: Client, message: Message, post_url: str):
+async def handle_download(bot: Client, message: Message, post_url: str, destination: str = "tg"):
     global forward_chat_id
     async with download_semaphore:
         if "?" in post_url:
@@ -147,56 +88,34 @@ async def handle_download(bot: Client, message: Message, post_url: str):
             effective_forward_chat_id = None
             if forward_chat_id:
                 ok, err_msg = await check_forward_permission(bot, forward_chat_id)
-                if not ok:
-                    await message.reply(
-                        f"⚠️ **Forward chat misconfigured:** {err_msg}\n\n"
-                        "The file will be sent to you only."
-                    )
-                else:
-                    effective_forward_chat_id = forward_chat_id
+                if ok: effective_forward_chat_id = forward_chat_id
 
             chat_id, message_id = getChatMsgID(post_url)
             chat_message = await user.get_messages(chat_id=chat_id, message_ids=message_id)
 
-            LOGGER(__name__).info(f"Downloading media from URL: {post_url}")
-
             if chat_message.document or chat_message.video or chat_message.audio:
                 file_size = (
-                    chat_message.document.file_size
-                    if chat_message.document
-                    else chat_message.video.file_size
-                    if chat_message.video
+                    chat_message.document.file_size if chat_message.document
+                    else chat_message.video.file_size if chat_message.video
                     else chat_message.audio.file_size
                 )
-
-                if not await fileSizeLimit(
-                    file_size, message, "download", user.me.is_premium
-                ):
+                if not await fileSizeLimit(file_size, message, "download", user.me.is_premium):
                     return
 
-            raw_caption, raw_caption_entities = get_raw_text(
-                chat_message.caption, chat_message.caption_entities
-            )
-            raw_text, raw_text_entities = get_raw_text(
-                chat_message.text, chat_message.entities
-            )
+            raw_caption, raw_caption_entities = get_raw_text(chat_message.caption, chat_message.caption_entities)
+            raw_text, raw_text_entities = get_raw_text(chat_message.text, chat_message.entities)
 
             if chat_message.media_group_id:
+                if destination == "gdrive":
+                    await message.reply("⚠️ **Notice:** Google Drive upload does not natively support Telegram Albums. Uploading Album to Telegram instead.")
                 if not await processMediaGroup(chat_message, bot, message, forward_chat_id=effective_forward_chat_id):
-                    await message.reply(
-                        "**Could not extract any valid media from the media group.**"
-                    )
+                    await message.reply("**Could not extract any valid media from the media group.**")
                 return
 
             has_downloadable_media = (
-                chat_message.photo
-                or chat_message.video
-                or chat_message.audio
-                or chat_message.document
-                or chat_message.voice
-                or chat_message.video_note
-                or chat_message.animation
-                or chat_message.sticker
+                chat_message.photo or chat_message.video or chat_message.audio or 
+                chat_message.document or chat_message.voice or chat_message.video_note or 
+                chat_message.animation or chat_message.sticker
             )
 
             if has_downloadable_media:
@@ -212,14 +131,11 @@ async def handle_download(bot: Client, message: Message, post_url: str):
                         media_path = await chat_message.download(
                             file_name=download_path,
                             progress=Leaves.progress_for_pyrogram,
-                            progress_args=progressArgs(
-                                "📥 Downloading Progress", progress_message, start_time
-                            ),
+                            progress_args=progressArgs("📥 Downloading Progress", progress_message, start_time),
                         )
                         break
                     except FloodWait as e:
                         wait_s = int(getattr(e, "value", 0) or 0)
-                        LOGGER(__name__).warning(f"FloodWait while downloading media: {wait_s}s")
                         if wait_s > 0 and attempt == 0:
                             await asyncio.sleep(wait_s + 1)
                             continue
@@ -229,262 +145,127 @@ async def handle_download(bot: Client, message: Message, post_url: str):
                     await progress_message.edit("**❌ Download failed: File not saved properly**")
                     return
 
-                file_size = os.path.getsize(media_path)
-                if file_size == 0:
-                    await progress_message.edit("**❌ Download failed: File is empty**")
-                    cleanup_download(media_path)
-                    return
-
-                LOGGER(__name__).info(f"Downloaded media: {media_path} (Size: {file_size} bytes)")
-
-                media_type = (
-                    "photo"
-                    if chat_message.photo
-                    else "video"
-                    if chat_message.video
-                    else "audio"
-                    if chat_message.audio
-                    else "document"
-                )
-                await send_media(
-                    bot,
-                    message,
-                    media_path,
-                    media_type,
-                    raw_caption,
-                    raw_caption_entities,
-                    progress_message,
-                    start_time,
-                    forward_chat_id=effective_forward_chat_id,
-                )
+                # ✅ --- GOOGLE DRIVE UPLOAD LOGIC ---
+                if destination == "gdrive":
+                    await progress_message.edit("**☁️ Uploading securely to your Google Drive...**")
+                    try:
+                        loop = asyncio.get_event_loop()
+                        # Pass the specific user_id to the Drive function
+                        drive_link = await loop.run_in_executor(None, upload_to_drive_user, message.from_user.id, media_path)
+                        
+                        await message.reply(f"✅ **Saved to your Google Drive in 'Telegram downloads' folder!**\n\n[🔗 View File Here]({drive_link})", disable_web_page_preview=True)
+                        await progress_message.delete()
+                    except Exception as e:
+                        await progress_message.edit(f"❌ **Google Drive Upload Failed:** `{e}`")
+                
+                # ✅ --- TELEGRAM UPLOAD LOGIC ---
+                else:
+                    media_type = ("photo" if chat_message.photo else "video" if chat_message.video else "audio" if chat_message.audio else "document")
+                    await send_media(
+                        bot, message, media_path, media_type, raw_caption,
+                        raw_caption_entities, progress_message, start_time,
+                        forward_chat_id=effective_forward_chat_id,
+                    )
+                    await progress_message.delete()
 
                 cleanup_download(media_path)
-                await progress_message.delete()
-
-            elif chat_message.poll:
-                await message.reply("**This post contains a poll which cannot be downloaded.**")
 
             elif chat_message.text or chat_message.caption:
                 txt = raw_text or raw_caption
                 ents = raw_text_entities if raw_text else raw_caption_entities
-                sent_text = None
+                if destination == "gdrive":
+                    await message.reply("📝 **Notice:** Texts cannot be saved to Drive. Forwarding to Telegram instead.")
                 try:
-                    sent_text = await message.reply(txt, entities=ents or None)
-                except BadRequest as e:
-                    if "ENTITY_TEXT_INVALID" in str(e):
-                        LOGGER(__name__).warning(f"ENTITY_TEXT_INVALID in text reply, retrying without entities: {e}")
-                        sent_text = await message.reply(txt)
-                    else:
-                        raise
-                if effective_forward_chat_id and sent_text:
-                    try:
-                        await bot.copy_message(
-                            chat_id=effective_forward_chat_id,
-                            from_chat_id=sent_text.chat.id,
-                            message_id=sent_text.id,
-                        )
-                        LOGGER(__name__).info(f"Copied text message to chat: {effective_forward_chat_id}")
-                    except Exception as e:
-                        LOGGER(__name__).error(f"Failed to copy text message to {effective_forward_chat_id}: {e}")
-            else:
-                await message.reply("**No media or text found in the post URL.**")
-
-        except FloodWait as e:
-            wait_s = int(getattr(e, "value", 0) or 0)
-            LOGGER(__name__).warning(f"FloodWait in handle_download: {wait_s}s")
-            if wait_s > 0:
-                await asyncio.sleep(wait_s + 1)
-            return
-        except PeerIdInvalid as e:
-            LOGGER(__name__).error(f"PeerIdInvalid for {post_url}: {e}")
-            await message.reply(
-                "**❌ Access Denied**\n\n"
-                "The user client cannot access this chat.\n"
-                "Make sure the user account has joined the channel/group.\n\n"
-                f"**Details:** `{e}`"
-            )
-        except BadRequest as e:
-            LOGGER(__name__).error(f"BadRequest for {post_url}: {e}")
-            await message.reply(
-                "**❌ Bad Request**\n\n"
-                f"Telegram returned an error: `{e}`\n\n"
-                "This may happen if the message ID is invalid or the chat is inaccessible."
-            )
-        except KeyError as e:
-            LOGGER(__name__).error(f"KeyError for {post_url}: {e}")
-            await message.reply(f"**❌ Invalid URL format:** `{e}`")
-        except Exception as e:
-            LOGGER(__name__).error(f"Unexpected error for {post_url}: {e}")
-            await message.reply(f"**❌ Unexpected error:** `{e}`")
-
-
-@bot.on_message(filters.command("dl") & filters.private)
-async def download_media(bot: Client, message: Message):
-    if len(message.command) < 2:
-        await message.reply("**Provide a post URL after the /dl command.**")
-        return
-
-    post_url = message.command[1]
-    await track_task(handle_download(bot, message, post_url))
-
-
-@bot.on_message(filters.command("bdl") & filters.private)
-async def download_range(bot: Client, message: Message):
-    args = message.text.split()
-
-    if len(args) != 3 or not all(arg.startswith("https://t.me/") for arg in args[1:]):
-        await message.reply(
-            "🚀 **Batch Download Process**\n"
-            "`/bdl start_link end_link`\n\n"
-            "💡 **Example:**\n"
-            "`/bdl https://t.me/mychannel/100 https://t.me/mychannel/120`"
-        )
-        return
-
-    try:
-        start_chat, start_id = getChatMsgID(args[1])
-        end_chat,   end_id   = getChatMsgID(args[2])
-    except Exception as e:
-        return await message.reply(f"**❌ Error parsing links:\n{e}**")
-
-    if start_chat != end_chat:
-        return await message.reply("**❌ Both links must be from the same channel.**")
-    if start_id > end_id:
-        return await message.reply("**❌ Invalid range: start ID cannot exceed end ID.**")
-
-    try:
-        await user.get_chat(start_chat)
-    except Exception:
-        pass
-
-    prefix = args[1].rsplit("/", 1)[0]
-    loading = await message.reply(f"📥 **Downloading posts {start_id}–{end_id}…**")
-
-    downloaded = skipped = failed = 0
-    processed_media_groups = set()
-    batch_tasks = []
-    BATCH_SIZE = PyroConf.BATCH_SIZE
-
-    for msg_id in range(start_id, end_id + 1):
-        url = f"{prefix}/{msg_id}"
-        try:
-            chat_msg = await user.get_messages(chat_id=start_chat, message_ids=msg_id)
-            if not chat_msg:
-                skipped += 1
-                continue
-
-            if chat_msg.media_group_id:
-                if chat_msg.media_group_id in processed_media_groups:
-                    skipped += 1
-                    continue
-                processed_media_groups.add(chat_msg.media_group_id)
-
-            has_media = bool(chat_msg.media_group_id or chat_msg.media)
-            has_text  = bool(chat_msg.text or chat_msg.caption)
-            if not (has_media or has_text):
-                skipped += 1
-                continue
-
-            task = track_task(handle_download(bot, message, url))
-            batch_tasks.append(task)
-
-            if len(batch_tasks) >= BATCH_SIZE:
-                results = await asyncio.gather(*batch_tasks, return_exceptions=True)
-                for result in results:
-                    if isinstance(result, asyncio.CancelledError):
-                        await loading.delete()
-                        return await message.reply(
-                            f"**❌ Batch canceled** after downloading `{downloaded}` posts."
-                        )
-                    elif isinstance(result, Exception):
-                        failed += 1
-                        LOGGER(__name__).error(f"Error: {result}")
-                    else:
-                        downloaded += 1
-
-                batch_tasks.clear()
-                await asyncio.sleep(PyroConf.FLOOD_WAIT_DELAY)
+                    await message.reply(txt, entities=ents or None)
+                except BadRequest:
+                    await message.reply(txt)
 
         except Exception as e:
-            failed += 1
-            LOGGER(__name__).error(f"Error at {url}: {e}")
-
-    if batch_tasks:
-        results = await asyncio.gather(*batch_tasks, return_exceptions=True)
-        for result in results:
-            if isinstance(result, Exception):
-                failed += 1
-            else:
-                downloaded += 1
-
-    await loading.delete()
-    await message.reply(
-        "**✅ Batch Process Complete!**\n"
-        "━━━━━━━━━━━━━━━━━━━\n"
-        f"📥 **Downloaded** : `{downloaded}` post(s)\n"
-        f"⏭️ **Skipped**    : `{skipped}` (no content)\n"
-        f"❌ **Failed**     : `{failed}` error(s)"
-    )
+            await message.reply(f"**❌ Error processing link:** `{e}`")
 
 
-@bot.on_message(filters.private & ~filters.command(["start", "help", "dl", "bdl", "stats", "logs", "killall", "cleanup"]))
+@bot.on_callback_query(filters.regex(r"^dest_(tg|gdrive)$"))
+async def process_dest_choice(client: Client, callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    choice = callback_query.data.split("_")[1]
+
+    if user_id not in PENDING_DOWNLOADS:
+        return await callback_query.answer("No pending downloads found. Please send the link again.", show_alert=True)
+
+    data = PENDING_DOWNLOADS[user_id]
+    url = data["url"]
+    msg = data["message"]
+
+    # ✅ IF G-DRIVE: Check if user has linked their account
+    if choice == "gdrive":
+        if not get_user_credentials(user_id):
+            auth_url = generate_auth_url()
+            AWAITING_AUTH[user_id] = True
+            
+            auth_message = (
+                "⚠️ **Google Drive is not linked!**\n\n"
+                f"1. [Click Here to Login securely via Google]({auth_url})\n"
+                "2. Choose your account and grant permission.\n"
+                "3. Your browser will eventually redirect to a page that says **'Site cannot be reached'** (the URL will start with `http://localhost...`).\n"
+                "4. **Copy that ENTIRE URL** from your browser's address bar and paste it as a message here to complete the link."
+            )
+            return await callback_query.message.edit_text(auth_message, disable_web_page_preview=True)
+
+    # Remove buttons and proceed
+    PENDING_DOWNLOADS.pop(user_id)
+    await callback_query.message.delete()
+    await track_task(handle_download(bot, msg, url, destination=choice))
+
+
+# ✅ --- CATCH ALL MESSAGES & AUTH CODES ---
+@bot.on_message(filters.private & ~filters.command(["start", "help", "cleanup", "cancel"]))
 async def handle_any_message(bot: Client, message: Message):
-    if message.text and not message.text.startswith("/"):
-        await track_task(handle_download(bot, message, message.text))
+    user_id = message.from_user.id
+    text = message.text or ""
+
+    # If the bot is waiting for the user to paste their localhost Auth link
+    if AWAITING_AUTH.get(user_id):
+        if text.startswith("http://localhost") or text.startswith("http://127.0.0.1"):
+            try:
+                msg = await message.reply("⏳ Verifying your Google Drive connection...")
+                authorize_user(user_id, text)  # Process the pasted URL
+                
+                del AWAITING_AUTH[user_id]
+                await msg.edit_text("✅ **Successfully linked!** Your Google Drive is ready.")
+                
+                # Automatically resume their download since they successfully connected
+                if user_id in PENDING_DOWNLOADS:
+                    data = PENDING_DOWNLOADS.pop(user_id)
+                    await track_task(handle_download(bot, data["message"], data["url"], destination="gdrive"))
+            except Exception as e:
+                await message.reply(f"❌ **Failed to authorize:** `{e}`\n\nPlease click the login link again or send `/cancel` to stop.")
+            return
+        else:
+            return await message.reply("⚠️ **You are currently linking Google Drive.**\n\nPlease paste the `http://localhost...` link you got from your browser, or send `/cancel` to abort.")
+
+    # Normal user sending a telegram post link
+    if text and not text.startswith("/"):
+        PENDING_DOWNLOADS[user_id] = {"url": text, "message": message}
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📤 Send here on Telegram", callback_data="dest_tg")],
+            [InlineKeyboardButton("☁️ Upload to my Google Drive", callback_data="dest_gdrive")]
+        ])
+        await message.reply("Where would you like to save this file?", reply_markup=keyboard)
 
 
-@bot.on_message(filters.command("stats") & filters.private)
-async def stats(_, message: Message):
-    currentTime = get_readable_time(time() - PyroConf.BOT_START_TIME)
-    total, used, free = shutil.disk_usage(".")
-    total = get_readable_file_size(total)
-    used = get_readable_file_size(used)
-    free = get_readable_file_size(free)
-    sent = get_readable_file_size(psutil.net_io_counters().bytes_sent)
-    recv = get_readable_file_size(psutil.net_io_counters().bytes_recv)
-    cpuUsage = psutil.cpu_percent(interval=0.5)
-    memory = psutil.virtual_memory().percent
-    disk = psutil.disk_usage("/").percent
-    process = psutil.Process(os.getpid())
-
-    stats = (
-        "**≧◉◡◉≦ Bot is Up and Running successfully.**\n\n"
-        f"**➜ Bot Uptime:** `{currentTime}`\n"
-        f"**➜ Total Disk Space:** `{total}`\n"
-        f"**➜ Used:** `{used}`\n"
-        f"**➜ Free:** `{free}`\n"
-        f"**➜ Memory Usage:** `{round(process.memory_info()[0] / 1024**2)} MiB`\n\n"
-        f"**➜ Upload:** `{sent}`\n"
-        f"**➜ Download:** `{recv}`\n\n"
-        f"**➜ CPU:** `{cpuUsage}%` | "
-        f"**➜ RAM:** `{memory}%` | "
-        f"**➜ DISK:** `{disk}%`"
-    )
-    await message.reply(stats)
-
-
-@bot.on_message(filters.command("logs") & filters.private)
-async def logs(_, message: Message):
-    if os.path.exists("logs.txt"):
-        await message.reply_document(document="logs.txt", caption="**Logs**")
+@bot.on_message(filters.command("cancel") & filters.private)
+async def cancel_auth(_, message: Message):
+    user_id = message.from_user.id
+    if AWAITING_AUTH.pop(user_id, None):
+        PENDING_DOWNLOADS.pop(user_id, None)
+        await message.reply("✅ Google Drive linking cancelled.")
     else:
-        await message.reply("**Not exists**")
-
-
-@bot.on_message(filters.command("killall") & filters.private)
-async def cancel_all_tasks(_, message: Message):
-    cancelled = 0
-    for task in list(RUNNING_TASKS):
-        if not task.done():
-            task.cancel()
-            cancelled += 1
-    await message.reply(f"**Cancelled {cancelled} running task(s).**")
+        await message.reply("Nothing to cancel.")
 
 
 async def initialize():
     global download_semaphore, forward_chat_id
     download_semaphore = asyncio.Semaphore(PyroConf.MAX_CONCURRENT_DOWNLOADS)
-
     if PyroConf.FORWARD_CHAT_ID:
         forward_chat_id = await resolve_forward_chat_id(PyroConf.FORWARD_CHAT_ID)
         LOGGER(__name__).info(f"Auto-forward enabled. Target chat: {forward_chat_id}")
