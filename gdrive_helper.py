@@ -13,6 +13,9 @@ SCOPES = ['https://www.googleapis.com/auth/drive.file']
 CLIENT_SECRETS_FILE = 'credentials.json'
 USER_TOKENS_FILE = 'user_tokens.json'
 
+# Dictionary to hold the login session (and code verifier)
+AUTH_FLOWS = {}
+
 def load_user_tokens():
     if os.path.exists(USER_TOKENS_FILE):
         with open(USER_TOKENS_FILE, 'r') as f:
@@ -31,44 +34,48 @@ def get_user_credentials(user_id):
     user_id_str = str(user_id)
     if user_id_str in tokens:
         creds = Credentials.from_authorized_user_info(tokens[user_id_str], SCOPES)
-        # Auto-refresh if expired
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
             save_user_token(user_id, json.loads(creds.to_json()))
         return creds
     return None
 
-def generate_auth_url():
-    """Generates the Google login link for the user."""
+def generate_auth_url(user_id):
+    """Generates the Google login link and saves the flow state securely."""
     flow = Flow.from_client_secrets_file(
         CLIENT_SECRETS_FILE,
         scopes=SCOPES,
         redirect_uri='http://localhost:8080/'
     )
     auth_url, _ = flow.authorization_url(prompt='consent')
+    
+    # SAVE the flow object so we keep the 'code verifier'
+    AUTH_FLOWS[str(user_id)] = flow 
     return auth_url
 
 def authorize_user(user_id, auth_response_url):
-    """Exchanges the localhost URL the user pastes for permanent tokens."""
-    flow = Flow.from_client_secrets_file(
-        CLIENT_SECRETS_FILE,
-        scopes=SCOPES,
-        redirect_uri='http://localhost:8080/'
-    )
+    """Exchanges the localhost URL using the saved flow state."""
+    # Retrieve the saved flow that contains the code verifier
+    flow = AUTH_FLOWS.get(str(user_id))
+    
+    if not flow:
+        raise Exception("Login session expired or missing. Please click the Google Drive upload button again to generate a new link.")
+        
     flow.fetch_token(authorization_response=auth_response_url)
     creds = flow.credentials
     save_user_token(user_id, json.loads(creds.to_json()))
+    
+    # Clean up the memory after successful login
+    del AUTH_FLOWS[str(user_id)]
 
 def get_or_create_folder(service):
     """Finds or creates the 'Telegram downloads' folder in the user's Drive."""
     folder_name = 'Telegram downloads'
-    # Query Drive for a folder with this exact name
     query = f"mimeType='application/vnd.google-apps.folder' and name='{folder_name}' and trashed=false"
     results = service.files().list(q=query, spaces='drive', fields='files(id, name)').execute()
     items = results.get('files', [])
     
     if not items:
-        # Create it if it doesn't exist
         folder_metadata = {
             'name': folder_name,
             'mimeType': 'application/vnd.google-apps.folder'
@@ -93,6 +100,4 @@ def upload_to_drive_user(user_id, file_path):
     
     media = MediaFileUpload(file_path, resumable=True)
     file = service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
-    
-    # We do NOT make permissions public here because it's their own Drive! They already have access.
     return file.get('webViewLink')
