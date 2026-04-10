@@ -199,7 +199,7 @@ async def process_dest_choice(client: Client, callback_query: CallbackQuery):
     # ✅ IF G-DRIVE: Check if user has linked their account
     if choice == "gdrive":
         if not get_user_credentials(user_id):
-            auth_url = generate_auth_url()
+            auth_url = generate_auth_url(user_id)
             AWAITING_AUTH[user_id] = True
             
             auth_message = (
