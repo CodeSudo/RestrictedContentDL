@@ -13,7 +13,7 @@ SCOPES = ['https://www.googleapis.com/auth/drive.file']
 CLIENT_SECRETS_FILE = 'credentials.json'
 USER_TOKENS_FILE = 'user_tokens.json'
 
-# Dictionary to hold the login session (and code verifier)
+# Dictionary to hold the login session (and code verifier for PKCE)
 AUTH_FLOWS = {}
 
 def load_user_tokens():
@@ -55,7 +55,6 @@ def generate_auth_url(user_id):
 
 def authorize_user(user_id, auth_response_url):
     """Exchanges the localhost URL using the saved flow state."""
-    # Retrieve the saved flow that contains the code verifier
     flow = AUTH_FLOWS.get(str(user_id))
     
     if not flow:
@@ -65,7 +64,6 @@ def authorize_user(user_id, auth_response_url):
     creds = flow.credentials
     save_user_token(user_id, json.loads(creds.to_json()))
     
-    # Clean up the memory after successful login
     del AUTH_FLOWS[str(user_id)]
 
 def get_or_create_folder(service):

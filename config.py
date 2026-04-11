@@ -1,6 +1,6 @@
 # Copyright (C) @TheSmartBisnu
 # Channel: https://t.me/itsSmartDev
-
+import os
 from os import getenv
 from time import time
 from dotenv import load_dotenv
@@ -30,6 +30,7 @@ class PyroConf(object):
     BOT_TOKEN = getenv("BOT_TOKEN")
     SESSION_STRING = getenv("SESSION_STRING")
     BOT_START_TIME = time()
+    SUPER_ADMIN_ID = int(os.environ.get("SUPER_ADMIN_ID", 0))
 
     MAX_CONCURRENT_DOWNLOADS = int(getenv("MAX_CONCURRENT_DOWNLOADS", "1"))
     BATCH_SIZE = int(getenv("BATCH_SIZE", "1"))
