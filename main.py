@@ -5,11 +5,12 @@ import os
 import shutil
 import psutil
 import asyncio
+import re
 from time import time
 
 from pyleaves import Leaves
 from pyrogram.enums import ParseMode
-from pyrogram import Client, filters
+from pyrogram import Client, filters, compose
 from pyrogram.errors import PeerIdInvalid, BadRequest, FloodWait
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
@@ -23,7 +24,7 @@ from helpers.msg import getChatMsgID, get_file_name, get_raw_text
 from config import PyroConf
 from logger import LOGGER
 
-# ✅ Import our new per-user GDrive logic
+# Import our new per-user GDrive logic
 from gdrive_helper import upload_to_drive_user, get_user_credentials, generate_auth_url, authorize_user
 
 # Initialize the bot client
@@ -145,11 +146,11 @@ async def handle_download(bot: Client, message: Message, post_url: str, destinat
                     await progress_message.edit("**❌ Download failed: File not saved properly**")
                     return
 
-                # ✅ --- GOOGLE DRIVE UPLOAD LOGIC ---
+                # --- GOOGLE DRIVE UPLOAD LOGIC ---
                 if destination == "gdrive":
                     await progress_message.edit("**☁️ Uploading securely to your Google Drive...**")
                     try:
-                        loop = asyncio.get_event_loop()
+                        loop = asyncio.get_running_loop() 
                         # Pass the specific user_id to the Drive function
                         drive_link = await loop.run_in_executor(None, upload_to_drive_user, message.from_user.id, media_path)
                         
@@ -158,7 +159,7 @@ async def handle_download(bot: Client, message: Message, post_url: str, destinat
                     except Exception as e:
                         await progress_message.edit(f"❌ **Google Drive Upload Failed:** `{e}`")
                 
-                # ✅ --- TELEGRAM UPLOAD LOGIC ---
+                # --- TELEGRAM UPLOAD LOGIC ---
                 else:
                     media_type = ("photo" if chat_message.photo else "video" if chat_message.video else "audio" if chat_message.audio else "document")
                     await send_media(
@@ -196,7 +197,7 @@ async def process_dest_choice(client: Client, callback_query: CallbackQuery):
     url = data["url"]
     msg = data["message"]
 
-    # ✅ IF G-DRIVE: Check if user has linked their account
+    # IF G-DRIVE: Check if user has linked their account
     if choice == "gdrive":
         if not get_user_credentials(user_id):
             auth_url = generate_auth_url(user_id)
@@ -217,8 +218,8 @@ async def process_dest_choice(client: Client, callback_query: CallbackQuery):
     await track_task(handle_download(bot, msg, url, destination=choice))
 
 
-# ✅ --- CATCH ALL MESSAGES & AUTH CODES ---
-@bot.on_message(filters.private & ~filters.command(["start", "help", "cleanup", "cancel"]))
+# --- CATCH ALL MESSAGES, LINKS & AUTH CODES ---
+@bot.on_message((filters.private & ~filters.command(["start", "help", "cleanup", "cancel"])) | filters.command(["dl", "bdl"]))
 async def handle_any_message(bot: Client, message: Message):
     user_id = message.from_user.id
     text = message.text or ""
@@ -243,14 +244,27 @@ async def handle_any_message(bot: Client, message: Message):
         else:
             return await message.reply("⚠️ **You are currently linking Google Drive.**\n\nPlease paste the `http://localhost...` link you got from your browser, or send `/cancel` to abort.")
 
-    # Normal user sending a telegram post link
-    if text and not text.startswith("/"):
-        PENDING_DOWNLOADS[user_id] = {"url": text, "message": message}
+    # Check if they are replying to a message to get the link from there
+    target_text = text
+    if message.reply_to_message and not "t.me/" in text:
+        target_text = message.reply_to_message.text or ""
+
+    # Look specifically for a valid Telegram link anywhere in the message
+    url_match = re.search(r"(https?://t\.me/[^\s]+)", target_text)
+
+    if url_match:
+        clean_url = url_match.group(1) # Extracts purely the link
+        PENDING_DOWNLOADS[user_id] = {"url": clean_url, "message": message}
+        
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("📤 Send here on Telegram", callback_data="dest_tg")],
             [InlineKeyboardButton("☁️ Upload to my Google Drive", callback_data="dest_gdrive")]
         ])
         await message.reply("Where would you like to save this file?", reply_markup=keyboard)
+    
+    # If no link was found, but they clearly tried to use a download command
+    elif text.startswith(("/dl", "/bdl")) or text.lower().startswith(("dl ", "bdl ")):
+        await message.reply("⚠️ **Please provide a valid Telegram link.**\nUse `/dl <link>` or reply to a message containing a link.")
 
 
 @bot.on_message(filters.command("cancel") & filters.private)
@@ -270,12 +284,17 @@ async def initialize():
         forward_chat_id = await resolve_forward_chat_id(PyroConf.FORWARD_CHAT_ID)
         LOGGER(__name__).info(f"Auto-forward enabled. Target chat: {forward_chat_id}")
 
+
+async def main():
+    await initialize()
+    LOGGER(__name__).info("Starting Bot and User Clients...")
+    await compose([bot, user])
+
 if __name__ == "__main__":
     try:
-        LOGGER(__name__).info("Bot Started!")
-        asyncio.get_event_loop().run_until_complete(initialize())
-        user.start()
-        bot.run()
+        # Use the existing event loop instead of creating a new one
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(main())
     except KeyboardInterrupt:
         pass
     except Exception as err:
