@@ -62,7 +62,8 @@ async def start(_, message: Message):
         "👋 **Welcome to Media Downloader Bot!**\n\n"
         "I can grab photos, videos, audio, and documents from any Telegram post.\n"
         "Just send me a link (paste it directly or use `/dl <link>`),\n"
-        "or reply to a message with `/dl`.\n\n"
+        "For Batch downloads, use a range: `/bdl https://t.me/channel/10-150`\n"
+        "Or bridge two links: `/bdl https://t.me/c/10 https://t.me/c/150`\n\n"
         "Ready? Send me a Telegram post link!"
     )
     markup = InlineKeyboardMarkup([[InlineKeyboardButton("Update Channel", url="https://t.me/itsSmartDev")]])
@@ -79,7 +80,7 @@ async def cleanup_storage(_, message: Message):
         LOGGER(__name__).error(f"Cleanup failed: {e}")
         return await message.reply("❌ **Cleanup failed.** Check logs for details.")
 
-async def handle_download(bot: Client, message: Message, post_url: str, destination: str = "tg"):
+async def handle_download(bot: Client, message: Message, post_url: str, destination: str = "tg", processed_groups: set = None):
     global forward_chat_id
     async with download_semaphore:
         if "?" in post_url:
@@ -108,9 +109,16 @@ async def handle_download(bot: Client, message: Message, post_url: str, destinat
 
             if chat_message.media_group_id:
                 if destination == "gdrive":
-                    await message.reply("⚠️ **Notice:** Google Drive upload does not natively support Telegram Albums. Uploading Album to Telegram instead.")
+                    pass # Only warn once during batch, handled elsewhere to prevent spam
+                
+                # Check if this album was already processed by another link in a batch
+                if processed_groups is not None:
+                    if chat_message.media_group_id in processed_groups:
+                        return # Skip downloading duplicate albums
+                    processed_groups.add(chat_message.media_group_id)
+
                 if not await processMediaGroup(chat_message, bot, message, forward_chat_id=effective_forward_chat_id):
-                    await message.reply("**Could not extract any valid media from the media group.**")
+                    await message.reply(f"**Could not extract any valid media from album link: {post_url}**")
                 return
 
             has_downloadable_media = (
@@ -121,7 +129,7 @@ async def handle_download(bot: Client, message: Message, post_url: str, destinat
 
             if has_downloadable_media:
                 start_time = time()
-                progress_message = await message.reply("**📥 Downloading Progress...**")
+                progress_message = await message.reply(f"**📥 Downloading:** `{post_url.split('/')[-1]}`")
 
                 filename = get_file_name(message_id, chat_message)
                 download_path = get_download_path(message.id, filename)
@@ -143,18 +151,17 @@ async def handle_download(bot: Client, message: Message, post_url: str, destinat
                         raise
 
                 if not media_path or not os.path.exists(media_path):
-                    await progress_message.edit("**❌ Download failed: File not saved properly**")
+                    await progress_message.edit(f"**❌ Download failed for {post_url}: File not saved properly**")
                     return
 
                 # --- GOOGLE DRIVE UPLOAD LOGIC ---
                 if destination == "gdrive":
-                    await progress_message.edit("**☁️ Uploading securely to your Google Drive...**")
+                    await progress_message.edit(f"**☁️ Uploading `{post_url.split('/')[-1]}` securely to your Google Drive...**")
                     try:
                         loop = asyncio.get_running_loop() 
-                        # Pass the specific user_id to the Drive function
                         drive_link = await loop.run_in_executor(None, upload_to_drive_user, message.from_user.id, media_path)
                         
-                        await message.reply(f"✅ **Saved to your Google Drive in 'Telegram downloads' folder!**\n\n[🔗 View File Here]({drive_link})", disable_web_page_preview=True)
+                        await message.reply(f"✅ **Saved to your Google Drive!**\n\n[🔗 View File Here]({drive_link})", disable_web_page_preview=True)
                         await progress_message.delete()
                     except Exception as e:
                         await progress_message.edit(f"❌ **Google Drive Upload Failed:** `{e}`")
@@ -174,15 +181,13 @@ async def handle_download(bot: Client, message: Message, post_url: str, destinat
             elif chat_message.text or chat_message.caption:
                 txt = raw_text or raw_caption
                 ents = raw_text_entities if raw_text else raw_caption_entities
-                if destination == "gdrive":
-                    await message.reply("📝 **Notice:** Texts cannot be saved to Drive. Forwarding to Telegram instead.")
                 try:
                     await message.reply(txt, entities=ents or None)
                 except BadRequest:
                     await message.reply(txt)
 
         except Exception as e:
-            await message.reply(f"**❌ Error processing link:** `{e}`")
+            await message.reply(f"**❌ Error processing link `{post_url}`:** `{e}`")
 
 
 @bot.on_callback_query(filters.regex(r"^dest_(tg|gdrive)$"))
@@ -194,7 +199,7 @@ async def process_dest_choice(client: Client, callback_query: CallbackQuery):
         return await callback_query.answer("No pending downloads found. Please send the link again.", show_alert=True)
 
     data = PENDING_DOWNLOADS[user_id]
-    url = data["url"]
+    urls = data["urls"]
     msg = data["message"]
 
     # IF G-DRIVE: Check if user has linked their account
@@ -207,15 +212,24 @@ async def process_dest_choice(client: Client, callback_query: CallbackQuery):
                 "⚠️ **Google Drive is not linked!**\n\n"
                 f"1. [Click Here to Login securely via Google]({auth_url})\n"
                 "2. Choose your account and grant permission.\n"
-                "3. Your browser will eventually redirect to a page that says **'Site cannot be reached'** (the URL will start with `http://localhost...`).\n"
-                "4. **Copy that ENTIRE URL** from your browser's address bar and paste it as a message here to complete the link."
+                "3. Your browser will eventually redirect to a page that says **'Site cannot be reached'**.\n"
+                "4. **Copy that ENTIRE URL** and paste it as a message here to complete the link."
             )
             return await callback_query.message.edit_text(auth_message, disable_web_page_preview=True)
 
     # Remove buttons and proceed
     PENDING_DOWNLOADS.pop(user_id)
     await callback_query.message.delete()
-    await track_task(handle_download(bot, msg, url, destination=choice))
+    
+    if len(urls) > 1:
+        await msg.reply(f"🔄 **Batch Mode:** Queuing `{len(urls)}` links...\nThey will be processed continuously in the background.")
+
+    processed_groups = set()
+    for i, url in enumerate(urls):
+        await track_task(handle_download(bot, msg, url, destination=choice, processed_groups=processed_groups))
+        # Yield to event loop occasionally to prevent blocking on massive batches
+        if i % 100 == 0:
+            await asyncio.sleep(0.1)
 
 
 # --- CATCH ALL MESSAGES, LINKS & AUTH CODES ---
@@ -224,47 +238,95 @@ async def handle_any_message(bot: Client, message: Message):
     user_id = message.from_user.id
     text = message.text or ""
 
-    # If the bot is waiting for the user to paste their localhost Auth link
     if AWAITING_AUTH.get(user_id):
         if text.startswith("http://localhost") or text.startswith("http://127.0.0.1"):
             try:
                 msg = await message.reply("⏳ Verifying your Google Drive connection...")
-                authorize_user(user_id, text)  # Process the pasted URL
-                
+                authorize_user(user_id, text)
                 del AWAITING_AUTH[user_id]
                 await msg.edit_text("✅ **Successfully linked!** Your Google Drive is ready.")
                 
-                # Automatically resume their download since they successfully connected
                 if user_id in PENDING_DOWNLOADS:
                     data = PENDING_DOWNLOADS.pop(user_id)
-                    await track_task(handle_download(bot, data["message"], data["url"], destination="gdrive"))
+                    urls = data["urls"]
+                    msg_obj = data["message"]
+                    
+                    if len(urls) > 1:
+                        await msg_obj.reply(f"🔄 **Batch Mode:** Queuing `{len(urls)}` links...")
+
+                    processed_groups = set()
+                    for i, url in enumerate(urls):
+                        await track_task(handle_download(bot, msg_obj, url, destination="gdrive", processed_groups=processed_groups))
+                        if i % 100 == 0:
+                            await asyncio.sleep(0.1)
             except Exception as e:
                 await message.reply(f"❌ **Failed to authorize:** `{e}`\n\nPlease click the login link again or send `/cancel` to stop.")
             return
         else:
-            return await message.reply("⚠️ **You are currently linking Google Drive.**\n\nPlease paste the `http://localhost...` link you got from your browser, or send `/cancel` to abort.")
+            return await message.reply("⚠️ **You are currently linking Google Drive.**\n\nPlease paste the `http://localhost...` link, or send `/cancel` to abort.")
 
-    # Check if they are replying to a message to get the link from there
     target_text = text
     if message.reply_to_message and not "t.me/" in text:
         target_text = message.reply_to_message.text or ""
 
-    # Look specifically for a valid Telegram link anywhere in the message
-    url_match = re.search(r"(https?://t\.me/[^\s]+)", target_text)
+    urls = []
+    pattern = r"(https?://t\.me/(?:c/)?[a-zA-Z0-9_]+/(?:[a-zA-Z0-9_]+/)*)(\d+)(?:-(\d+))?"
+    matches = list(re.finditer(pattern, target_text))
+    is_bdl_command = text.startswith(("/bdl", "bdl"))
+    
+    # 🌟 Bridging two separate links
+    if is_bdl_command and len(matches) == 2 and matches[0].group(1) == matches[1].group(1) and not matches[0].group(3) and not matches[1].group(3):
+        base_url = matches[0].group(1)
+        start_id = int(matches[0].group(2))
+        end_id = int(matches[1].group(2))
+        
+        if start_id > end_id:
+            start_id, end_id = end_id, start_id 
+            
+        # Generous hard cap of 5000 to prevent bot freeze/crashes
+        if end_id - start_id > 5000:
+            await message.reply("⚠️ **Range is extremely large!** Capping at 5,000 files to prevent server crash.")
+            end_id = start_id + 5000
+        
+        for msg_id in range(start_id, end_id + 1):
+            urls.append(f"{base_url}{msg_id}")
+            
+    else:
+        # Standard hyphen range processing
+        for match in matches:
+            base_url = match.group(1)
+            start_id = int(match.group(2))
+            end_id = match.group(3)
+            
+            if end_id:
+                start, end = start_id, int(end_id)
+                if start > end:
+                    start, end = end, start 
+                
+                if end - start > 5000:
+                    await message.reply("⚠️ **Range is extremely large!** Capping at 5,000 files to prevent server crash.")
+                    end = start + 5000
+                
+                for msg_id in range(start, end + 1):
+                    urls.append(f"{base_url}{msg_id}")
+            else:
+                urls.append(match.group(0))
+            
+    if not urls:
+        urls = re.findall(r"(https?://t\.me/[^\s]+)", target_text)
 
-    if url_match:
-        clean_url = url_match.group(1) # Extracts purely the link
-        PENDING_DOWNLOADS[user_id] = {"url": clean_url, "message": message}
+    if urls:
+        urls = list(dict.fromkeys(urls))
+        PENDING_DOWNLOADS[user_id] = {"urls": urls, "message": message}
         
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📤 Send here on Telegram", callback_data="dest_tg")],
-            [InlineKeyboardButton("☁️ Upload to my Google Drive", callback_data="dest_gdrive")]
+            [InlineKeyboardButton(f"📤 Send on Telegram ({len(urls)} files)", callback_data="dest_tg")],
+            [InlineKeyboardButton(f"☁️ Upload to Google Drive ({len(urls)} files)", callback_data="dest_gdrive")]
         ])
-        await message.reply("Where would you like to save this file?", reply_markup=keyboard)
+        await message.reply(f"Where would you like to save this file batch?", reply_markup=keyboard)
     
-    # If no link was found, but they clearly tried to use a download command
     elif text.startswith(("/dl", "/bdl")) or text.lower().startswith(("dl ", "bdl ")):
-        await message.reply("⚠️ **Please provide a valid Telegram link.**\nUse `/dl <link>` or reply to a message containing a link.")
+        await message.reply("⚠️ **Please provide a valid Telegram link.**\nUse `/dl <link>` or `/bdl <link>`.")
 
 
 @bot.on_message(filters.command("cancel") & filters.private)
@@ -284,7 +346,6 @@ async def initialize():
         forward_chat_id = await resolve_forward_chat_id(PyroConf.FORWARD_CHAT_ID)
         LOGGER(__name__).info(f"Auto-forward enabled. Target chat: {forward_chat_id}")
 
-
 async def main():
     await initialize()
     LOGGER(__name__).info("Starting Bot and User Clients...")
@@ -292,7 +353,6 @@ async def main():
 
 if __name__ == "__main__":
     try:
-        # Use the existing event loop instead of creating a new one
         loop = asyncio.get_event_loop()
         loop.run_until_complete(main())
     except KeyboardInterrupt:
